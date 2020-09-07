@@ -13,10 +13,23 @@ import importlib
 
 
 def init_hf_bert_biencoder(args, **kwargs):
+    print('LOAD MODEL')
     if importlib.util.find_spec("transformers") is None:
         raise RuntimeError('Please install transformers lib')
     from .hf_models import get_bert_biencoder_components
     return get_bert_biencoder_components(args, **kwargs)
+
+def init_attention_biencoder(args, **kwargs):
+    if importlib.util.find_spec("transformers") is None:
+        raise RuntimeError('Please install transformers lib')
+    from .attention_models import get_bert_biencoder_components
+    return get_bert_biencoder_components(args, **kwargs)
+
+def init_colbert(args, **kwargs):
+    if importlib.util.find_spec("transformers") is None:
+        raise RuntimeError('Please install transformers lib')
+    from .colbert import get_colbert
+    return get_colbert(args, **kwargs)
 
 
 def init_hf_bert_reader(args, **kwargs):
@@ -55,6 +68,8 @@ def init_hf_roberta_tenzorizer(args, **kwargs):
 
 
 BIENCODER_INITIALIZERS = {
+    'hf_attention': init_attention_biencoder,
+    'colbert': init_colbert,
     'hf_bert': init_hf_bert_biencoder,
     'pytext_bert': init_pytext_bert_biencoder,
     'fairseq_roberta': init_fairseq_roberta_biencoder,

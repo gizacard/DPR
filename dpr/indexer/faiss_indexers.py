@@ -23,7 +23,8 @@ class DenseIndexer(object):
 
     def __init__(self, buffer_size: int = 50000):
         self.buffer_size = buffer_size
-        self.index_id_to_db_id = []
+        #self.index_id_to_db_id = []
+        self.index_id_to_db_id = np.empty((0), dtype=np.int64)
         self.index = None
 
     def index_data(self, data: List[Tuple[object, np.array]]):
@@ -57,7 +58,9 @@ class DenseIndexer(object):
             self.index_id_to_db_id) == self.index.ntotal, 'Deserialized index_id_to_db_id should match faiss index size'
 
     def _update_id_mapping(self, db_ids: List):
-        self.index_id_to_db_id.extend(db_ids)
+        new_ids = np.array(db_ids, dtype=np.int64)
+        self.index_id_to_db_id = np.concatenate((self.index_id_to_db_id, new_ids), axis=0)
+        #self.index_id_to_db_id.extend(db_ids)
 
 
 class DenseFlatIndexer(DenseIndexer):
@@ -66,13 +69,19 @@ class DenseFlatIndexer(DenseIndexer):
         super(DenseFlatIndexer, self).__init__(buffer_size=buffer_size)
         self.index = faiss.IndexFlatIP(vector_sz)
 
-    def index_data(self, data: List[Tuple[object, np.array]]):
+    def index_data(self, data: List[Tuple[object, np.array]], is_colbert: bool = False):
         n = len(data)
         # indexing in batches is beneficial for many faiss index types
         for i in range(0, n, self.buffer_size):
-            db_ids = [t[0] for t in data[i:i + self.buffer_size]]
-            vectors = [np.reshape(t[1], (1, -1)) for t in data[i:i + self.buffer_size]]
-            vectors = np.concatenate(vectors, axis=0)
+            if is_colbert:
+                db_ids = []
+                for t in data[i:i+self.buffer_size]:
+                    db_ids.extend([int(t[0])]*t[1].shape[0])
+            else:
+                db_ids = [t[0] for t in data[i:i + self.buffer_size]]
+                #vectors = [np.reshape(t[1], (1, -1)) for t in data[i:i + self.buffer_size]]
+                #vectors = np.concatenate(vectors, axis=0)
+            vectors = np.vstack([t[1] for t in data[i:i+self.buffer_size]]) #colbert
             self._update_id_mapping(db_ids)
             self.index.add(vectors)
 
@@ -82,9 +91,39 @@ class DenseFlatIndexer(DenseIndexer):
     def search_knn(self, query_vectors: np.array, top_docs: int) -> List[Tuple[List[object], List[float]]]:
         scores, indexes = self.index.search(query_vectors, top_docs)
         # convert to external ids
-        db_ids = [[self.index_id_to_db_id[i] for i in query_top_idxs] for query_top_idxs in indexes]
+        db_ids = [[str(self.index_id_to_db_id[i]) for i in query_top_idxs] for query_top_idxs in indexes]
         result = [(db_ids[i], scores[i]) for i in range(len(db_ids))]
         return result
+
+    def search_knn_all(self, query_vectors: np.array, top_docs: int) -> List[Tuple[List[object], List[float]]]:
+        nqueries, nvectors, dim = query_vectors.shape 
+        query_vectors = query_vectors.reshape(nqueries*nvectors, dim)
+        scores, indexes = self.index.search(query_vectors, top_docs)
+        # convert to external ids
+        indexes = indexes.reshape(nqueries, nvectors, top_docs)
+        scores = scores.reshape(nqueries, nvectors, top_docs)
+        db_ids = self.index_id_to_db_id[indexes]
+        result = []
+        top_doc = []
+        for i in range(len(scores)):
+            max_scores = []
+            ids = []
+            example_ids = db_ids[i].reshape(-1)
+            example_scores = scores[i].reshape(-1)
+            unique_db_ids, unique_index = np.unique(example_ids, return_inverse=True)
+            for j in range(len(unique_db_ids)):
+                select_arr = (unique_index==j)
+                select_scores = example_scores[select_arr]
+                max_scores.append(np.max(select_scores))
+                ids.append(unique_db_ids[j])
+            max_scores = np.array(max_scores)
+            ids = np.array(ids)
+            idx = np.argsort(-np.array(max_scores))
+            sorted_ids = ids[idx]
+            sorted_scores = max_scores[idx]
+            result.append((sorted_ids, sorted_scores))
+            top_doc.append(sorted_ids)
+        return top_doc
 
 
 class DenseHNSWFlatIndexer(DenseIndexer):
@@ -104,7 +143,7 @@ class DenseHNSWFlatIndexer(DenseIndexer):
         self.index = index
         self.phi = 0
 
-    def index_data(self, data: List[Tuple[object, np.array]]):
+    def index_data(self, data: List[Tuple[object, np.array]], is_colbert: bool):
         n = len(data)
 
         # max norm is required before putting all vectors in the index to convert inner product similarity to L2
@@ -152,3 +191,99 @@ class DenseHNSWFlatIndexer(DenseIndexer):
         super(DenseHNSWFlatIndexer, self).deserialize_from(file)
         # to trigger warning on subsequent indexing
         self.phi = 1
+
+
+class IVFPQIndexer(DenseIndexer):
+    """
+     Efficient index for retrieval. Note: default settings are for hugh accuracy but also high RAM usage
+    """
+
+    def __init__(self, vector_sz: int, buffer_size: int = 50000, nlist: int = 128, n_subquantizers: int = 64):
+        super(IVFPQIndexer, self).__init__(buffer_size=buffer_size)
+
+        #quantizer = faiss.IndexFlatIP(vector_sz)  # this remains the same
+        #index = faiss.IndexIVFPQ(quantizer, vector_sz, nlist, n_subquantizers, 8)# faiss.METRIC_INNER_PRODUCT)
+        #quantizer = faiss.IndexFlatIP(vector_sz)  # the other index
+        #index = faiss.IndexIVFFlat(quantizer, vector_sz, nlist) 
+        #index = faiss.index_factory(vector_sz, "PQ128x8", faiss.METRIC_INNER_PRODUCT)
+        quantizer = faiss.IndexFlatIP(vector_sz)
+        index = faiss.IndexIVFFlat(quantizer, vector_sz, 256, faiss.METRIC_INNER_PRODUCT)
+        index.nprobe = 8
+
+        self.index = index
+
+    #def index_data(self, data: List[Tuple[object, np.array]]):
+    #    n = len(data)
+    #    # indexing in batches is beneficial for many faiss index types
+    #    for i in range(0, n, self.buffer_size):
+    #        db_ids = [t[0] for t in data[i:i + self.buffer_size]]
+    #        db_ids = [[t[0]] * t[1].size(0) for t in data[i:i + self.buffer_size]]
+    #        vectors = np.vstack([t[1] for t in data[i:i+self.buffer_size]])
+    #        vectors = [np.reshape(t[1], (1, -1)) for t in data[i:i + self.buffer_size]]
+    #        #vectors = np.concatenate(vectors, axis=0)
+    #        self._update_id_mapping(db_ids)
+    #        if not self.index.is_trained:
+    #            self.index.train(vectors)
+    #        self.index.add(vectors)
+
+    #    indexed_cnt = len(self.index_id_to_db_id)
+    #    logger.info('Total data indexed %d', indexed_cnt)
+
+    def index_data(self, data: List[Tuple[object, np.array]], is_colbert: bool):
+        n = len(data)
+        # indexing in batches is beneficial for many faiss index types
+
+        for i in range(0, n, self.buffer_size):
+            if is_colbert:
+                db_ids = []
+                for t in data[i:i+self.buffer_size]:
+                    db_ids.extend([int(t[0])]*t[1].shape[0])
+            else:
+                db_ids = [t[0] for t in data[i:i + self.buffer_size]]
+            vectors = np.vstack([t[1] for t in data[i:i+self.buffer_size]]) #colbert
+            self._update_id_mapping(db_ids)
+            print(vectors.shape)
+            if not self.index.is_trained:
+                self.index.train(vectors)
+            self.index.add(vectors)
+
+        indexed_cnt = len(self.index_id_to_db_id)
+        logger.info('Total data indexed %d', indexed_cnt)
+
+    def search_knn(self, query_vectors: np.array, top_docs: int) -> List[Tuple[List[object], List[float]]]:
+        scores, indexes = self.index.search(query_vectors, top_docs)
+        # convert to external ids
+        db_ids = [[self.index_id_to_db_id[i] for i in query_top_idxs] for query_top_idxs in indexes]
+        result = [(db_ids[i], scores[i]) for i in range(len(db_ids))]
+        return result
+
+
+    def search_knn_all(self, query_vectors: np.array, top_docs: int) -> List[Tuple[List[object], List[float]]]:
+        nqueries, nvectors, dim = query_vectors.shape 
+        query_vectors = query_vectors.reshape(nqueries*nvectors, dim)
+        scores, indexes = self.index.search(query_vectors, top_docs)
+        # convert to external ids
+        indexes = indexes.reshape(nqueries, nvectors, top_docs)
+        scores = scores.reshape(nqueries, nvectors, top_docs)
+        db_ids = self.index_id_to_db_id[indexes]
+        result = []
+        top_doc = []
+        for i in range(len(scores)):
+            max_scores = []
+            ids = []
+            example_ids = db_ids[i].reshape(-1)
+            example_scores = scores[i].reshape(-1)
+            unique_db_ids, unique_index = np.unique(example_ids, return_inverse=True)
+            for j in range(len(unique_db_ids)):
+                select_arr = (unique_index==j)
+                select_scores = example_scores[select_arr]
+                max_scores.append(np.max(select_scores))
+                ids.append(unique_db_ids[j])
+            max_scores = np.array(max_scores)
+            ids = np.array(ids)
+            idx = np.argsort(-np.array(max_scores))
+            sorted_ids = ids[idx]
+            sorted_scores = max_scores[idx]
+            result.append((sorted_ids, sorted_scores))
+            top_doc.append(sorted_ids)
+        return top_doc

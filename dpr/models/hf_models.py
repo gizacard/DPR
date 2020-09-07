@@ -41,7 +41,6 @@ def get_bert_biencoder_components(args, inference_only: bool = False, **kwargs):
                               learning_rate=args.learning_rate,
                               adam_eps=args.adam_eps, weight_decay=args.weight_decay,
                               ) if not inference_only else None
-
     tensorizer = get_bert_tensorizer(args)
 
     return tensorizer, biencoder, optimizer
@@ -65,6 +64,7 @@ def get_bert_reader_components(args, inference_only: bool = False, **kwargs):
 
 
 def get_bert_tensorizer(args, tokenizer=None):
+    print('init tensorizer')
     if not tokenizer:
         tokenizer = get_bert_tokenizer(args.pretrained_model_cfg, do_lower_case=args.do_lower_case)
     return BertTensorizer(tokenizer, args.sequence_length)
@@ -90,6 +90,7 @@ def get_optimizer(model: nn.Module, learning_rate: float = 1e-5, adam_eps: float
 
 
 def get_bert_tokenizer(pretrained_cfg_name: str, do_lower_case: bool = True):
+    print('init bert tokenizer')
     return BertTokenizer.from_pretrained(pretrained_cfg_name, do_lower_case=do_lower_case)
 
 
@@ -112,6 +113,7 @@ class HFBertEncoder(BertModel):
         if dropout != 0:
             cfg.attention_probs_dropout_prob = dropout
             cfg.hidden_dropout_prob = dropout
+        print(cfg_name)
         return cls.from_pretrained(cfg_name, config=cfg, project_dim=projection_dim, **kwargs)
 
     def forward(self, input_ids: T, token_type_ids: T, attention_mask: T) -> Tuple[T, ...]:

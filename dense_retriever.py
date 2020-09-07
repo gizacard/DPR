@@ -29,7 +29,7 @@ from dpr.options import add_encoder_params, setup_args_gpu, print_args, set_enco
     add_tokenizer_params, add_cuda_params
 from dpr.utils.data_utils import Tensorizer
 from dpr.utils.model_utils import setup_for_distributed_mode, get_model_obj, load_states_from_checkpoint
-from dpr.indexer.faiss_indexers import DenseIndexer, DenseHNSWFlatIndexer, DenseFlatIndexer
+from dpr.indexer.faiss_indexers import DenseIndexer, DenseHNSWFlatIndexer, DenseFlatIndexer, IVFPQIndexer
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -43,11 +43,12 @@ class DenseRetriever(object):
     """
     Does passage retrieving over the provided index and question encoder
     """
-    def __init__(self, question_encoder: nn.Module, batch_size: int, tensorizer: Tensorizer, index: DenseIndexer):
+    def __init__(self, question_encoder: nn.Module, batch_size: int, tensorizer: Tensorizer, index: DenseIndexer, is_colbert: bool):
         self.question_encoder = question_encoder
         self.batch_size = batch_size
         self.tensorizer = tensorizer
         self.index = index
+        self.is_colbert = is_colbert
 
     def generate_question_vectors(self, questions: List[str]) -> T:
         n = len(questions)
@@ -58,9 +59,15 @@ class DenseRetriever(object):
 
         with torch.no_grad():
             for j, batch_start in enumerate(range(0, n, bsz)):
+                all_q = []
+                for q in questions[batch_start:batch_start + bsz]:
+                    q = ' '.join(['question:' , q])
+                    all_q.append(q)
 
-                batch_token_tensors = [self.tensorizer.text_to_tensor(q) for q in
-                                       questions[batch_start:batch_start + bsz]]
+                #batch_token_tensors = [self.tensorizer.text_to_tensor(q, max_length=40) for q in
+                #                       questions[batch_start:batch_start + bsz]]
+                batch_token_tensors = [self.tensorizer.text_to_tensor(q, max_length=40) for q in all_q]
+                #print(self.tensorizer.tokenizer.decode(list(batch_token_tensors[0].cpu().numpy())))
 
                 q_ids_batch = torch.stack(batch_token_tensors, dim=0).cuda()
                 q_seg_batch = torch.zeros_like(q_ids_batch).cuda()
@@ -79,7 +86,7 @@ class DenseRetriever(object):
         assert query_tensor.size(0) == len(questions)
         return query_tensor
 
-    def index_encoded_data(self, vector_files: List[str], buffer_size: int = 50000):
+    def index_encoded_data(self, vector_files: List[str], buffer_size: int = 50000, create_memmap: bool = False):
         """
         Indexes encoded passages takes form a list of files
         :param vector_files: file names to get passages vectors from
@@ -87,16 +94,32 @@ class DenseRetriever(object):
         :return:
         """
         buffer = []
+        if create_memmap:
+            memmap = np.memmap('encoded_passage.npy', dtype=np.float32, mode='w+', shape=(21015324, 250, 16))
+            memmap_pos = 0
+        else:
+            memmap = None
         for i, item in enumerate(iterate_encoded_files(vector_files)):
             db_id, doc_vector = item
+            #print('iter', db_id, doc_vector.shape)
             buffer.append((db_id, doc_vector))
-            if 0 < buffer_size == len(buffer):
-                self.index.index_data(buffer)
+            if 0 < buffer_size  and len(buffer) >= buffer_size:
+                if create_memmap:
+                    vectors = np.vstack([t[1][None] for t in buffer])
+                    memmap[memmap_pos:(memmap_pos+vectors.shape[0])] = vectors
+                    memmap_pos += vectors.shape[0]
+                self.index.index_data(buffer, self.is_colbert)
                 buffer = []
-        self.index.index_data(buffer)
+        self.index.index_data(buffer, self.is_colbert)
+        if create_memmap:
+            vectors = np.vstack([t[1][None] for t in buffer])
+            memmap[memmap_pos:(memmap_pos+vectors.shape[0])] = vectors
+
         logger.info('Data indexing completed.')
 
-    def get_top_docs(self, query_vectors: np.array, top_docs: int = 100) -> List[Tuple[List[object], List[float]]]:
+        return memmap
+
+    def get_top_docs(self, query_vectors: np.array, top_docs: int = 100, is_colbert: bool=False) -> List[Tuple[List[object], List[float]]]:
         """
         Does the retrieval of the best matching passages given the query vectors batch
         :param query_vectors:
@@ -104,9 +127,34 @@ class DenseRetriever(object):
         :return:
         """
         time0 = time.time()
-        results = self.index.search_knn(query_vectors, top_docs)
+        if is_colbert:
+            results = self.index.search_knn_all(query_vectors, top_docs)
+        else:
+            results = self.index.search_knn(query_vectors, top_docs) 
         logger.info('index search time: %f sec.', time.time() - time0)
         return results
+
+    def exact_search(self, query_vectors: np.array, memmap: np.memmap, top_ids: np.array, top_docs: int = 100) -> List[Tuple[List[object], List[float]]]:
+        all_idx, all_scores, result = [], [], []
+        for i in range(len(query_vectors)):
+            q_top_ids = top_ids[i]
+            document_vectors = memmap[q_top_ids-1] #-1 to convert to memmap index
+            idx, scores = self.exact_score(query_vectors[i], document_vectors)
+            doc_ids = q_top_ids[idx[:top_docs]]
+            scores = scores[:top_docs]
+            doc_ids = [str(k) for k in doc_ids]
+            result.append((doc_ids, list(scores)))
+        return result
+
+    def exact_score(self, qv, dv):
+        scores = np.einsum('id,kjd->kij', qv, dv)
+        scores = scores.max(axis=2)
+        scores = scores.sum(axis=1)
+        sorted_idx = np.argsort(-scores)
+        sorted_scores = scores[sorted_idx]
+        return sorted_idx, sorted_scores
+
+
 
 
 def parse_qa_csv_file(location) -> Iterator[Tuple[str, List[str]]]:
@@ -132,7 +180,7 @@ def validate(passages: Dict[object, Tuple[str, str]], answers: List[List[str]],
 
 def load_passages(ctx_file: str) -> Dict[object, Tuple[str, str]]:
     docs = {}
-    logger.info('Reading data from: %s', ctx_file)
+    #logger.info('Reading data from: %s', ctx_file)
     with open(ctx_file) as tsvfile:
         reader = csv.reader(tsvfile, delimiter='\t', )
         # file format: doc_id, doc_text, title
@@ -187,49 +235,58 @@ def iterate_encoded_files(vector_files: list) -> Iterator[Tuple[object, np.array
 
 
 def main(args):
-    saved_state = load_states_from_checkpoint(args.model_file)
-    set_encoder_params_from_state(saved_state.encoder_params, args)
+    if not args.encoder_model_type == 'hf_attention' and not args.encoder_model_type == 'colbert':
+        saved_state = load_states_from_checkpoint(args.model_file)
+        set_encoder_params_from_state(saved_state.encoder_params, args)
 
     tensorizer, encoder, _ = init_biencoder_components(args.encoder_model_type, args, inference_only=True)
 
-    encoder = encoder.question_model
+    if not args.encoder_model_type == 'hf_attention' and not args.encoder_model_type == 'colbert':
+        encoder = encoder.question_model
 
     encoder, _ = setup_for_distributed_mode(encoder, None, args.device, args.n_gpu,
                                             args.local_rank,
                                             args.fp16)
     encoder.eval()
 
-    # load weights from the model file
-    model_to_load = get_model_obj(encoder)
-    logger.info('Loading saved model state ...')
+    if not args.encoder_model_type == 'hf_attention' and not args.encoder_model_type == 'colbert':
+        # load weights from the model file
+        model_to_load = get_model_obj(encoder)
+        logger.info('Loading saved model state ...')
 
-    prefix_len = len('question_model.')
-    question_encoder_state = {key[prefix_len:]: value for (key, value) in saved_state.model_dict.items() if
-                              key.startswith('question_model.')}
-    model_to_load.load_state_dict(question_encoder_state)
-    vector_size = model_to_load.get_out_size()
-    logger.info('Encoder vector_size=%d', vector_size)
+        prefix_len = len('question_model.')
+        question_encoder_state = {key[prefix_len:]: value for (key, value) in saved_state.model_dict.items() if
+                                  key.startswith('question_model.')}
+        model_to_load.load_state_dict(question_encoder_state)
+        vector_size = model_to_load.get_out_size()
+        logger.info('Encoder vector_size=%d', vector_size)
+    else:
+        vector_size = 16
 
     index_buffer_sz = args.index_buffer
+
     if args.hnsw_index:
-        index = DenseHNSWFlatIndexer(vector_size)
+        index = DenseHNSWFlatIndexer(vector_size, index_buffer_sz)
         index_buffer_sz = -1  # encode all at once
     else:
         index = DenseFlatIndexer(vector_size)
+    #index = IVFPQIndexer(vector_size, index_buffer_sz)
 
-    retriever = DenseRetriever(encoder, args.batch_size, tensorizer, index)
+    retriever = DenseRetriever(encoder, args.batch_size, tensorizer, index, args.encoder_model_type=='colbert')
 
     # index all passages
     ctx_files_pattern = args.encoded_ctx_file
     input_paths = glob.glob(ctx_files_pattern)
     logger.info('Reading all passages data from files: %s', input_paths)
-    retriever.index_encoded_data(input_paths, buffer_size=index_buffer_sz)
+    memmap = retriever.index_encoded_data(input_paths, buffer_size=index_buffer_sz, create_memmap=args.encoder_model_type=='colbert')
 
     # get questions & answers
     questions = []
     question_answers = []
 
-    for ds_item in parse_qa_csv_file(args.qa_file):
+    for i, ds_item in enumerate(parse_qa_csv_file(args.qa_file)):
+        #if i == 300:
+        #    break
         question, answers = ds_item
         questions.append(question)
         question_answers.append(answers)
@@ -237,7 +294,10 @@ def main(args):
     questions_tensor = retriever.generate_question_vectors(questions)
 
     # get top k results
-    top_ids_and_scores = retriever.get_top_docs(questions_tensor.numpy(), args.n_docs)
+    top_ids_and_scores = retriever.get_top_docs(questions_tensor.numpy(), args.n_docs, is_colbert=args.encoder_model_type=='colbert')
+
+    if args.encoder_model_type=='colbert':
+        top_ids_and_scores = retriever.exact_search(questions_tensor.numpy(), memmap, top_ids_and_scores, args.n_docs)
 
     all_passages = load_passages(args.ctx_file)
 

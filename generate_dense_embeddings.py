@@ -43,8 +43,17 @@ def gen_ctx_vectors(ctx_rows: List[Tuple[object, str, str]], model: nn.Module, t
     results = []
     for j, batch_start in enumerate(range(0, n, bsz)):
 
-        batch_token_tensors = [tensorizer.text_to_tensor(ctx[1], title=ctx[2] if insert_title else None) for ctx in
-                               ctx_rows[batch_start:batch_start + bsz]]
+        #all_txt = []
+        #for ctx in ctx_rows[batch_start:batch_start+bsz]:
+        #    if ctx[2]:
+        #        txt = ['title:', ctx[2], 'context:', ctx[1]]
+        #    else:
+        #        txt = ['context:', ctx[1]]
+        #    txt = ' '.join(txt)
+        #    all_txt.append(txt)
+        #batch_token_tensors = [tensorizer.text_to_tensor(txt, max_length=250) for txt in all_txt]
+        batch_token_tensors = [tensorizer.text_to_tensor(ctx[1], title=ctx[2] if insert_title else None) for ctx in #original 
+                               ctx_rows[batch_start:batch_start + bsz]]                                             #original
 
         ctx_ids_batch = move_to_device(torch.stack(batch_token_tensors, dim=0),args.device)
         ctx_seg_batch = move_to_device(torch.zeros_like(ctx_ids_batch),args.device)
@@ -59,8 +68,13 @@ def gen_ctx_vectors(ctx_rows: List[Tuple[object, str, str]], model: nn.Module, t
 
         total += len(ctx_ids)
 
+        #results.extend([
+        #    (ctx_ids[i], out[i].view(-1).numpy())
+        #    for i in range(out.size(0))
+        #])
+
         results.extend([
-            (ctx_ids[i], out[i].view(-1).numpy())
+            (ctx_ids[i], out[i].numpy())
             for i in range(out.size(0))
         ])
 
@@ -71,13 +85,15 @@ def gen_ctx_vectors(ctx_rows: List[Tuple[object, str, str]], model: nn.Module, t
 
 
 def main(args):
-    saved_state = load_states_from_checkpoint(args.model_file)
-    set_encoder_params_from_state(saved_state.encoder_params, args)
+    if not args.encoder_model_type == 'hf_attention' and not args.encoder_model_type == 'colbert':
+        saved_state = load_states_from_checkpoint(args.model_file)
+        set_encoder_params_from_state(saved_state.encoder_params, args)
     print_args(args)
     
     tensorizer, encoder, _ = init_biencoder_components(args.encoder_model_type, args, inference_only=True)
 
-    encoder = encoder.ctx_model
+    if not args.encoder_model_type == 'hf_attention' and not args.encoder_model_type == 'colbert':
+        encoder = encoder.ctx_model
 
     encoder, _ = setup_for_distributed_mode(encoder, None, args.device, args.n_gpu,
                                             args.local_rank,
@@ -88,20 +104,25 @@ def main(args):
     # load weights from the model file
     model_to_load = get_model_obj(encoder)
     logger.info('Loading saved model state ...')
-    logger.debug('saved model keys =%s', saved_state.model_dict.keys())
+    #logger.debug('saved model keys =%s', saved_state.model_dict.keys())
 
-    prefix_len = len('ctx_model.')
-    ctx_state = {key[prefix_len:]: value for (key, value) in saved_state.model_dict.items() if
-                 key.startswith('ctx_model.')}
-    model_to_load.load_state_dict(ctx_state)
+    if not args.encoder_model_type == 'hf_attention' and not args.encoder_model_type == 'colbert':
+        prefix_len = len('ctx_model.')
+        ctx_state = {key[prefix_len:]: value for (key, value) in saved_state.model_dict.items() if 
+                    key.startswith('ctx_model.')}
+        model_to_load.load_state_dict(ctx_state)
 
     logger.info('reading data from file=%s', args.ctx_file)
 
     rows = []
     with open(args.ctx_file) as tsvfile:
         reader = csv.reader(tsvfile, delimiter='\t')
-        # file format: doc_id, doc_text, title
-        rows.extend([(row[0], row[1], row[2]) for row in reader if row[0] != 'id'])
+        for k, row in enumerate(reader):
+            #if k == 1000:
+            #    break
+            if not row[0] == 'id':
+                rows.append((row[0], row[1], row[2]))
+        #rows.extend([(row[0], row[1], row[2]) for row in reader if row[0] != 'id'])
 
     shard_size = int(len(rows) / args.num_shards)
     start_idx = args.shard_id * shard_size

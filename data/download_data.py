@@ -28,6 +28,14 @@ RESOURCES_MAP = {
         'compressed': True,
         'desc': 'Entire wikipedia passages set obtain by splitting all pages into 100-word segments (no overlap)'
     },
+
+    'compressed-data.wikipedia_split.psgs_w100': {
+        's3_url': 'https://dl.fbaipublicfiles.com/dpr/wikipedia_split/psgs_w100.tsv.gz',
+        'original_ext': '.tsv.gz',
+        'compressed': False,
+        'desc': 'Entire wikipedia passages set obtain by splitting all pages into 100-word segments (no overlap)'
+    },
+
     'data.retriever.nq-dev': {
         's3_url': 'https://dl.fbaipublicfiles.com/dpr/data/retriever/biencoder-nq-dev.json.gz',
         'original_ext': '.json',
@@ -56,6 +64,20 @@ RESOURCES_MAP = {
         'original_ext': '.json',
         'compressed': True,
         'desc': 'TriviaQA train subset with passages pools for the Retriever training'
+    },
+
+    'data.retriever.squad1-train': {
+        's3_url': 'https://dl.fbaipublicfiles.com/dpr/data/retriever/biencoder-squad1-train.json.gz',
+        'original_ext': '.json',
+        'compressed': True,
+        'desc': 'SQUAD 1.1 train subset with passages pools for the Retriever training'
+    },
+
+    'data.retriever.squad1-dev': {
+        's3_url': 'https://dl.fbaipublicfiles.com/dpr/data/retriever/biencoder-squad1-dev.json.gz',
+        'original_ext': '.json',
+        'compressed': True,
+        'desc': 'SQUAD 1.1 dev subset with passages pools for the Retriever train time validation'
     },
 
     'data.retriever.qas.nq-dev': {
@@ -148,6 +170,15 @@ RESOURCES_MAP = {
         'original_ext': '.pt',
         'compressed': False,
         'desc': 'Weights for pretrained pytext bert base model'
+    },
+
+    'data.retriever_results.nq.single.wikipedia_passages': {
+        's3_url': ['https://dl.fbaipublicfiles.com/dpr/data/wiki_encoded/single/nq/wiki_passages_{}'.format(i) for i in
+                   range(50)],
+        'original_ext': '.pkl',
+        'compressed': False,
+        'desc': 'Encoded wikipedia files using a biencoder checkpoint('
+                'checkpoint.retriever.single.nq.bert-base-encoder) trained on NQ dataset '
     },
 
     'data.retriever_results.nq.single.test': {
@@ -248,6 +279,64 @@ RESOURCES_MAP = {
         'compressed': False,
         'desc': 'Reader weights trained on Trivia multi hybrid retriever results and HF bert-base-uncased model'
     },
+
+    # extra checkpoints for EfficientQA competition
+    'checkpoint.reader.nq-single-subset.hf-bert-base': {
+        's3_url': 'https://dl.fbaipublicfiles.com/dpr/checkpoint/reader/nq-single-seen_only/hf_bert_base.cp',
+        'original_ext': '.cp',
+        'compressed': False,
+        'desc': 'Reader weights trained on NQ-single retriever results and HF bert-base-uncased model, when only Wikipedia pages seen during training are considered'
+    },
+    'checkpoint.reader.nq-tfidf.hf-bert-base': {
+        's3_url': 'https://dl.fbaipublicfiles.com/dpr/checkpoint/reader/nq-drqa/hf_bert_base.cp',
+        'original_ext': '.cp',
+        'compressed': False,
+        'desc': 'Reader weights trained on TFIDF results and HF bert-base-uncased model'
+    },
+    'checkpoint.reader.nq-tfidf-subset.hf-bert-base': {
+        's3_url': 'https://dl.fbaipublicfiles.com/dpr/checkpoint/reader/nq-drqa-seen_only/hf_bert_base.cp',
+        'original_ext': '.cp',
+        'compressed': False,
+        'desc': 'Reader weights trained on TFIDF results and HF bert-base-uncased model, when only Wikipedia pages seen during training are considered'
+    },
+
+    # retrieval indexes
+    'indexes.single.nq.full.index': {
+        's3_url': 'https://dl.fbaipublicfiles.com/dpr/checkpoint/indexes/single/nq/full.index.dpr',
+        'original_ext': '.dpr',
+        'compressed': False,
+        'desc': 'DPR index on NQ-single retriever'
+    },
+    'indexes.single.nq.full.index_meta': {
+        's3_url': 'https://dl.fbaipublicfiles.com/dpr/checkpoint/indexes/single/nq/full.index_meta.dpr',
+        'original_ext': '.dpr',
+        'compressed': False,
+        'desc': 'DPR index on NQ-single retriever (metadata)'
+    },
+    'indexes.single.nq.subset.index': {
+        's3_url': 'https://dl.fbaipublicfiles.com/dpr/checkpoint/indexes/single/nq/seen_only.index.dpr',
+        'original_ext': '.dpr',
+        'compressed': False,
+        'desc': 'DPR index on NQ-single retriever when only Wikipedia pages seen during training are considered'
+    },
+    'indexes.single.nq.subset.index_meta': {
+        's3_url': 'https://dl.fbaipublicfiles.com/dpr/checkpoint/indexes/single/nq/seen_only.index_meta.dpr',
+        'original_ext': '.dpr',
+        'compressed': False,
+        'desc': 'DPR index on NQ-single retriever when only Wikipedia pages seen during training are considered (metadata)'
+    },
+    'indexes.tfidf.nq.full': {
+        's3_url': 'https://dl.fbaipublicfiles.com/dpr/checkpoint/indexes/drqa/nq/full-tfidf.npz',
+        'original_ext': '.npz',
+        'compressed': False,
+        'desc': 'TFIDF index'
+    },
+    'indexes.tfidf.nq.subset': {
+        's3_url': 'https://dl.fbaipublicfiles.com/dpr/checkpoint/indexes/drqa/nq/seen_only-tfidf.npz',
+        'original_ext': '.npz',
+        'compressed': False,
+        'desc': 'TFIDF index when only Wikipedia pages seen during training are considered'
+    },
 }
 
 
@@ -319,11 +408,17 @@ def download(resource_key: str, out_dir: str = None):
     save_root_dir = None
     if isinstance(s3_url, list):
         for i, url in enumerate(s3_url):
-            save_root_dir = download_resource(url, download_info['original_ext'], download_info['compressed'],
-                                              '{}_{}'.format(resource_key, i), out_dir)
+            save_root_dir = download_resource(url,
+                                              download_info['original_ext'],
+                                              download_info['compressed'],
+                                              '{}_{}'.format(resource_key, i),
+                                              out_dir)
     else:
-        save_root_dir = download_resource(s3_url, download_info['original_ext'], download_info['compressed'],
-                                          resource_key, out_dir)
+        save_root_dir = download_resource(s3_url,
+                                          download_info['original_ext'],
+                                          download_info['compressed'],
+                                          resource_key,
+                                          out_dir)
 
     license_files = download_info.get('license_files', None)
     if not license_files:
@@ -338,10 +433,8 @@ def main():
 
     parser.add_argument("--output_dir", default="./", type=str,
                         help="The output directory to download file")
-
     parser.add_argument("--resource", type=str,
                         help="Resource name. See RESOURCES_MAP for all possible values")
-
     args = parser.parse_args()
     if args.resource:
         download(args.resource, args.output_dir)

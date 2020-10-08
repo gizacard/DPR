@@ -104,7 +104,7 @@ class DenseFlatIndexer(DenseIndexer):
         result = [(db_ids[i], scores[i]) for i in range(len(db_ids))]
         return result
 
-    def search_knn_all(self, query_vectors: np.array, top_docs: int) -> List[Tuple[List[object], List[float]]]:
+    def search_knn_colbert(self, query_vectors: np.array, top_docs: int) -> List[Tuple[List[object], List[float]]]:
         nqueries, nvectors, dim = query_vectors.shape 
         query_vectors = query_vectors.reshape(nqueries*nvectors, dim)
         scores, indexes = self.index.search(query_vectors, top_docs)
@@ -130,9 +130,10 @@ class DenseFlatIndexer(DenseIndexer):
             idx = np.argsort(-np.array(max_scores))
             sorted_ids = ids[idx]
             sorted_scores = max_scores[idx]
+            sorted_ids = [str(x) for x in sorted_ids]
             result.append((sorted_ids, sorted_scores))
             top_doc.append(sorted_ids)
-        return top_doc
+        return result
 
 
 class DenseHNSWFlatIndexer(DenseIndexer):
@@ -202,13 +203,13 @@ class DenseHNSWFlatIndexer(DenseIndexer):
         self.phi = 1
 
 
-class IVFPQIndexer(DenseIndexer):
+class CustomIndexer(DenseIndexer):
     """
      Efficient index for retrieval. Note: default settings are for hugh accuracy but also high RAM usage
     """
 
     def __init__(self, vector_sz: int, buffer_size: int = 50000, nlist: int = 128, n_subquantizers: int = 64):
-        super(IVFPQIndexer, self).__init__(buffer_size=buffer_size)
+        super(CustomIndexer, self).__init__(buffer_size=buffer_size)
 
         #quantizer = faiss.IndexFlatIP(vector_sz)  # this remains the same
         #index = faiss.IndexIVFPQ(quantizer, vector_sz, nlist, n_subquantizers, 8)# faiss.METRIC_INNER_PRODUCT)
@@ -216,42 +217,27 @@ class IVFPQIndexer(DenseIndexer):
         #index = faiss.IndexIVFFlat(quantizer, vector_sz, nlist) 
         #index = faiss.index_factory(vector_sz, "PQ128x8", faiss.METRIC_INNER_PRODUCT)
         quantizer = faiss.IndexFlatIP(vector_sz)
-        index = faiss.IndexIVFFlat(quantizer, vector_sz, 256, faiss.METRIC_INNER_PRODUCT)
-        index.nprobe = 8
+        index = faiss.IndexIVFFlat(quantizer, vector_sz, 16384, faiss.METRIC_INNER_PRODUCT)
+        #index = faiss.IndexFlatIP(vector_sz)
+        #index = faiss.index_factory(vector_sz, "SQ8")
+        index.nprobe = 32
 
         self.index = index
 
-    #def index_data(self, data: List[Tuple[object, np.array]]):
-    #    n = len(data)
-    #    # indexing in batches is beneficial for many faiss index types
-    #    for i in range(0, n, self.buffer_size):
-    #        db_ids = [t[0] for t in data[i:i + self.buffer_size]]
-    #        db_ids = [[t[0]] * t[1].size(0) for t in data[i:i + self.buffer_size]]
-    #        vectors = np.vstack([t[1] for t in data[i:i+self.buffer_size]])
-    #        vectors = [np.reshape(t[1], (1, -1)) for t in data[i:i + self.buffer_size]]
-    #        #vectors = np.concatenate(vectors, axis=0)
-    #        self._update_id_mapping(db_ids)
-    #        if not self.index.is_trained:
-    #            self.index.train(vectors)
-    #        self.index.add(vectors)
-
-    #    indexed_cnt = len(self.index_id_to_db_id)
-    #    logger.info('Total data indexed %d', indexed_cnt)
-
     def index_data(self, data: List[Tuple[object, np.array]], is_colbert: bool):
         n = len(data)
-        # indexing in batches is beneficial for many faiss index types
-
+        print('buffer_size', self.buffer_size, n)
         for i in range(0, n, self.buffer_size):
+            print(i)
             if is_colbert:
                 db_ids = []
                 for t in data[i:i+self.buffer_size]:
                     db_ids.extend([int(t[0])]*t[1].shape[0])
             else:
                 db_ids = [t[0] for t in data[i:i + self.buffer_size]]
-            vectors = np.vstack([t[1] for t in data[i:i+self.buffer_size]]) #colbert
+            vectors = np.vstack([t[1] for t in data[i:i+self.buffer_size]]) 
             self._update_id_mapping(db_ids)
-            print(vectors.shape)
+            print('vec', vectors.shape)
             if not self.index.is_trained:
                 self.index.train(vectors)
             self.index.add(vectors)
@@ -267,7 +253,7 @@ class IVFPQIndexer(DenseIndexer):
         return result
 
 
-    def search_knn_all(self, query_vectors: np.array, top_docs: int) -> List[Tuple[List[object], List[float]]]:
+    def search_knn_colbert(self, query_vectors: np.array, top_docs: int) -> List[Tuple[List[object], List[float]]]:
         nqueries, nvectors, dim = query_vectors.shape 
         query_vectors = query_vectors.reshape(nqueries*nvectors, dim)
         scores, indexes = self.index.search(query_vectors, top_docs)
@@ -292,7 +278,8 @@ class IVFPQIndexer(DenseIndexer):
             ids = np.array(ids)
             idx = np.argsort(-np.array(max_scores))
             sorted_ids = ids[idx]
+            sorted_ids = [str(x) for x in sorted_ids]
             sorted_scores = max_scores[idx]
             result.append((sorted_ids, sorted_scores))
             top_doc.append(sorted_ids)
-        return top_doc
+        return result

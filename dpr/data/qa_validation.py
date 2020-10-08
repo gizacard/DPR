@@ -80,6 +80,7 @@ def check_answer(questions_answers_docs, tokenizer, match_type) -> List[bool]:
     hits = []
 
     for i, doc_id in enumerate(doc_ids):
+        #print(doc_id)
         doc = dpr_all_documents[doc_id]
         text = doc[0]
 

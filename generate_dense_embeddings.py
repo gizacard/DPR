@@ -43,17 +43,17 @@ def gen_ctx_vectors(ctx_rows: List[Tuple[object, str, str]], model: nn.Module, t
     results = []
     for j, batch_start in enumerate(range(0, n, bsz)):
 
-        #all_txt = []
-        #for ctx in ctx_rows[batch_start:batch_start+bsz]:
-        #    if ctx[2]:
-        #        txt = ['title:', ctx[2], 'context:', ctx[1]]
-        #    else:
-        #        txt = ['context:', ctx[1]]
-        #    txt = ' '.join(txt)
-        #    all_txt.append(txt)
-        #batch_token_tensors = [tensorizer.text_to_tensor(txt, max_length=250) for txt in all_txt]
-        batch_token_tensors = [tensorizer.text_to_tensor(ctx[1], title=ctx[2] if insert_title else None) for ctx in #original 
-                               ctx_rows[batch_start:batch_start + bsz]]                                             #original
+        all_txt = []
+        for ctx in ctx_rows[batch_start:batch_start+bsz]:
+            if ctx[2]:
+                txt = ['title:', ctx[2], 'context:', ctx[1]]
+            else:
+                txt = ['context:', ctx[1]]
+            txt = ' '.join(txt)
+            all_txt.append(txt)
+        batch_token_tensors = [tensorizer.text_to_tensor(txt, max_length=250) for txt in all_txt]
+        #batch_token_tensors = [tensorizer.text_to_tensor(ctx[1], title=ctx[2] if insert_title else None) for ctx in #original 
+        #                       ctx_rows[batch_start:batch_start + bsz]]                                             #original
 
         ctx_ids_batch = move_to_device(torch.stack(batch_token_tensors, dim=0),args.device)
         ctx_seg_batch = move_to_device(torch.zeros_like(ctx_ids_batch),args.device)

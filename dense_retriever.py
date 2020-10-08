@@ -15,6 +15,7 @@ import csv
 import glob
 import json
 import gzip
+import sys
 import logging
 import pickle
 import time
@@ -31,7 +32,9 @@ from dpr.options import add_encoder_params, setup_args_gpu, print_args, set_enco
     add_tokenizer_params, add_cuda_params
 from dpr.utils.data_utils import Tensorizer
 from dpr.utils.model_utils import setup_for_distributed_mode, get_model_obj, load_states_from_checkpoint
-from dpr.indexer.faiss_indexers import DenseIndexer, DenseHNSWFlatIndexer, DenseFlatIndexer, IVFPQIndexer
+from dpr.indexer.faiss_indexers import DenseIndexer, DenseHNSWFlatIndexer, DenseFlatIndexer, CustomIndexer
+
+csv.field_size_limit(sys.maxsize)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -66,7 +69,7 @@ class DenseRetriever(object):
                     q = ' '.join(['question:' , q])
                     all_q.append(q)
 
-                #batch_token_tensors = [self.tensorizer.text_to_tensor(q, max_length=40) for q in
+                #batch_token_tensors = [self.tensorizer.text_to_tensor(q) for q in
                 #                       questions[batch_start:batch_start + bsz]]
                 batch_token_tensors = [self.tensorizer.text_to_tensor(q, max_length=40) for q in all_q]
                 #print(self.tensorizer.tokenizer.decode(list(batch_token_tensors[0].cpu().numpy())))
@@ -88,7 +91,7 @@ class DenseRetriever(object):
         assert query_tensor.size(0) == len(questions)
         return query_tensor
 
-    def index_encoded_data(self, vector_files: List[str], buffer_size: int = 50000, create_memmap: bool = False):
+    def index_encoded_data(self, vector_files: List[str], buffer_size: int = 50000, memmap: np.memmap = False):
         """
         Indexes encoded passages takes form a list of files
         :param vector_files: file names to get passages vectors from
@@ -96,24 +99,21 @@ class DenseRetriever(object):
         :return:
         """
         buffer = []
-        if create_memmap:
-            memmap = np.memmap('encoded_passage.npy', dtype=np.float32, mode='w+', shape=(21015324, 250, 16))
+        if memmap is not None:
             memmap_pos = 0
-        else:
-            memmap = None
         for i, item in enumerate(iterate_encoded_files(vector_files)):
             db_id, doc_vector = item
             #print('iter', db_id, doc_vector.shape)
             buffer.append((db_id, doc_vector))
             if 0 < buffer_size  and len(buffer) >= buffer_size:
-                if create_memmap:
+                if memmap is not None:
                     vectors = np.vstack([t[1][None] for t in buffer])
                     memmap[memmap_pos:(memmap_pos+vectors.shape[0])] = vectors
                     memmap_pos += vectors.shape[0]
                 self.index.index_data(buffer, self.is_colbert)
                 buffer = []
         self.index.index_data(buffer, self.is_colbert)
-        if create_memmap:
+        if memmap is not None:
             vectors = np.vstack([t[1][None] for t in buffer])
             memmap[memmap_pos:(memmap_pos+vectors.shape[0])] = vectors
 
@@ -130,22 +130,29 @@ class DenseRetriever(object):
         """
         time0 = time.time()
         if is_colbert:
-            results = self.index.search_knn_all(query_vectors, top_docs)
+            results = self.index.search_knn_colbert(query_vectors, top_docs)
         else:
             results = self.index.search_knn(query_vectors, top_docs) 
         logger.info('index search time: %f sec.', time.time() - time0)
         return results
 
-    def exact_search(self, query_vectors: np.array, memmap: np.memmap, top_ids: np.array, top_docs: int = 100) -> List[Tuple[List[object], List[float]]]:
+    def colbert_search(self, query_vectors: np.array, memmap: np.memmap, top_ids: np.array, top_docs: int = 100) -> List[Tuple[List[object], List[float]]]:
         all_idx, all_scores, result = [], [], []
+        all_docs, all_scores = [], []
         for i in range(len(query_vectors)):
-            q_top_ids = top_ids[i]
+            q_top_ids = top_ids[i][0]
+            q_top_ids = np.array([int(x) for x in q_top_ids])
             document_vectors = memmap[q_top_ids-1] #-1 to convert to memmap index
             idx, scores = self.exact_score(query_vectors[i], document_vectors)
             doc_ids = q_top_ids[idx[:top_docs]]
             scores = scores[:top_docs]
             doc_ids = [str(k) for k in doc_ids]
             result.append((doc_ids, list(scores)))
+            #all_docs.append(list(doc_ids))
+            #all_scores.append(list(scores))
+        #all_docs = np.vstack(all_docs)
+        #all_scores = np.vstack(all_scores)
+        #return all_docs, all_scores
         return result
 
     def exact_score(self, qv, dv):
@@ -162,9 +169,12 @@ class DenseRetriever(object):
 def parse_qa_csv_file(location) -> Iterator[Tuple[str, List[str]]]:
     with open(location) as ifile:
         reader = csv.reader(ifile, delimiter='\t')
-        for row in reader:
+        for i, row in enumerate(reader):
             question = row[0]
-            answers = eval(row[1])
+            try:
+                answers = eval(row[1])
+            except:
+                print(i, row)
             yield question, answers
 
 
@@ -245,6 +255,14 @@ def iterate_encoded_files(vector_files: list) -> Iterator[Tuple[object, np.array
 
 
 def main(args):
+    questions = []
+    question_answers = []
+    for i, ds_item in enumerate(parse_qa_csv_file(args.qa_file)):
+        #if i == 10:
+        #    break
+        question, answers = ds_item
+        questions.append(question)
+        question_answers.append(answers)
     if not args.encoder_model_type == 'hf_attention' and not args.encoder_model_type == 'colbert':
         saved_state = load_states_from_checkpoint(args.model_file)
         set_encoder_params_from_state(saved_state.encoder_params, args)
@@ -275,12 +293,13 @@ def main(args):
 
     index_buffer_sz = args.index_buffer
 
-    if args.hnsw_index:
+    if args.index_type == 'hnsw':
         index = DenseHNSWFlatIndexer(vector_size, index_buffer_sz)
         index_buffer_sz = -1  # encode all at once
+    elif args.index_type == 'custom':
+        index = CustomIndexer(vector_size, index_buffer_sz)
     else:
         index = DenseFlatIndexer(vector_size)
-    #index = IVFPQIndexer(vector_size, index_buffer_sz)
 
     retriever = DenseRetriever(encoder, args.batch_size, tensorizer, index, args.encoder_model_type=='colbert')
 
@@ -288,46 +307,67 @@ def main(args):
     # index all passages
     ctx_files_pattern = args.encoded_ctx_file
     input_paths = glob.glob(ctx_files_pattern)
-    logger.info('Reading all passages data from files: %s', input_paths)
-    memmap = retriever.index_encoded_data(input_paths, buffer_size=index_buffer_sz, create_memmap=args.encoder_model_type=='colbert')
-
+    #logger.info('Reading all passages data from files: %s', input_paths)
+    #memmap = retriever.index_encoded_data(input_paths, buffer_size=index_buffer_sz, memmap=args.encoder_model_type=='colbert')
+    print(input_paths)
     index_path = "_".join(input_paths[0].split("_")[:-1])
-    if args.save_or_load_index and os.path.exists(index_path):
-        retriever.index.deserialize(index_path)
+    memmap_path = 'memmap.npy'
+    print(args.save_or_load_index, os.path.exists(index_path), index_path)
+    if args.save_or_load_index and os.path.exists(index_path+'.index.dpr'):
+    #if False:
+        retriever.index.deserialize_from(index_path)
+        if args.encoder_model_type=='colbert':
+            memmap = np.memmap(memmap_path, dtype=np.float32, mode='w+', shape=(21015324, 250, 16))
+        else:
+            memmap = None
     else:
         logger.info('Reading all passages data from files: %s', input_paths)
-        retriever.index_encoded_data(input_paths, buffer_size=index_buffer_sz)
-        if args.save_or_load_index:
-            retriever.index.serialize(index_path)
+        if args.encoder_model_type=='colbert':
+            memmap = np.memmap(memmap_path, dtype=np.float32, mode='w+', shape=(21015324, 250, 16))
+        else:
+            memmap = None
+        retriever.index_encoded_data(input_paths, buffer_size=index_buffer_sz, memmap=memmap)
+        #if args.save_or_load_index:
+        #    retriever.index.serialize(index_path)
     # get questions & answers
-    questions = []
-    question_answers = []
 
-    for i, ds_item in enumerate(parse_qa_csv_file(args.qa_file)):
-        #if i == 300:
-        #    break
-        question, answers = ds_item
-        questions.append(question)
-        question_answers.append(answers)
+
 
     questions_tensor = retriever.generate_question_vectors(questions)
 
     # get top k results
     top_ids_and_scores = retriever.get_top_docs(questions_tensor.numpy(), args.n_docs, is_colbert=args.encoder_model_type=='colbert')
 
+    with open('approx_scores.pkl', 'wb') as f:
+        pickle.dump(top_ids_and_scores, f)
+
+    retriever.index.index.reset()
     if args.encoder_model_type=='colbert':
-        top_ids_and_scores = retriever.exact_search(questions_tensor.numpy(), memmap, top_ids_and_scores, args.n_docs)
+        logger.info('Colbert score') 
+        top_ids_and_scores_colbert = retriever.colbert_search(questions_tensor.numpy(), memmap, top_ids_and_scores, args.n_docs)
 
     all_passages = load_passages(args.ctx_file)
 
     if len(all_passages) == 0:
         raise RuntimeError('No passages data found. Please specify ctx_file param properly.')
 
+
+    with open('colbert_scores.pkl', 'wb') as f:
+        pickle.dump(top_ids_and_scores_colbert, f)
+
+    
+
     questions_doc_hits = validate(all_passages, question_answers, top_ids_and_scores, args.validation_workers,
                                   args.match)
+    if args.encoder_model_type=='colbert':
+        questions_doc_hits_colbert = validate(all_passages, question_answers, top_ids_and_scores_colbert, args.validation_workers,
+                                  args.match)
+        
 
     if args.out_file:
         save_results(all_passages, questions, question_answers, top_ids_and_scores, questions_doc_hits, args.out_file)
+        if args.encoder_model_type=='colbert':
+            save_results(all_passages, questions, question_answers, top_ids_and_scores_colbert, questions_doc_hits_colbert, args.out_file+'colbert')
 
 
 if __name__ == '__main__':
@@ -353,7 +393,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=32, help="Batch size for question encoder forward pass")
     parser.add_argument('--index_buffer', type=int, default=50000,
                         help="Temporal memory data buffer size (in samples) for indexer")
-    parser.add_argument("--hnsw_index", action='store_true', help='If enabled, use inference time efficient HNSW index')
+    parser.add_argument("--index_type", type=str, default='flat', help='Index type')
     parser.add_argument("--save_or_load_index", action='store_true', help='If enabled, save index')
 
     args = parser.parse_args()

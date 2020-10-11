@@ -327,8 +327,8 @@ def main(args):
         else:
             memmap = None
         retriever.index_encoded_data(input_paths, buffer_size=index_buffer_sz, memmap=memmap)
-        #if args.save_or_load_index:
-        #    retriever.index.serialize(index_path)
+        if args.save_or_load_index:
+            retriever.index.serialize(index_path)
     # get questions & answers
 
 
